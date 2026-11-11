@@ -490,6 +490,14 @@ export default function App() {
   const recordingIntervalRef = useRef<any>(null);
   const autoStopTimeoutRef = useRef<any>(null);
   const audioChunksRef = useRef<Blob[]>([]);
+  const recognitionRef = useRef<any>(null);
+
+  // Identificadores estáveis para controle do ciclo de vida dos gatilhos e diagnósticos
+  const executionIdRef = useRef<number>(0);
+  const activeExecutionIdRef = useRef<number>(0);
+  const hasEndedCurrentExecutionRef = useRef<number>(-1);
+  const handleVideoEndedRef = useRef<(source: string, execId?: number) => void>(() => {});
+  const videoFinishedRef = useRef<boolean>(false);
   
   // Mobile & Fullscreen States
   const [isMobile, setIsMobile] = useState<boolean>(() => {
@@ -779,76 +787,139 @@ export default function App() {
 
   const trigger1080pAutoPulse = triggerQualityAutoPulse;
 
-  // Attach YouTube Player API instance to the iframe for real-time HD enforcement
+  // 2. Suspende temporariamente o reconhecimento de voz durante reprodução de vídeos
+  const suspendSpeechRecognition = () => {
+    try {
+      if (recognitionRef.current) {
+        try { recognitionRef.current.abort(); } catch (_) {}
+      }
+    } catch (_) {}
+    try {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        try { mediaRecorderRef.current.stop(); } catch (_) {}
+      }
+    } catch (_) {}
+    try {
+      if (audioStreamRef.current) {
+        audioStreamRef.current.getTracks().forEach(track => track.stop());
+        audioStreamRef.current = null;
+      }
+    } catch (_) {}
+    setIsRecordingMedia(false);
+    setIsListening(false);
+    setIsTranscribing(false);
+    setAudioLevel(0);
+  };
+
+  // Attach YouTube Player API instance to the iframe for real-time HD enforcement and ended event capture
   const attachYtPlayer = () => {
     if (typeof window === "undefined") return;
+    const currentExec = activeExecutionIdRef.current;
     try {
       const YT = (window as any).YT;
       if (YT && YT.Player && ytIframeRef.current) {
-        if (ytPlayerInstanceRef.current && typeof ytPlayerInstanceRef.current.destroy === "function") {
-          try { ytPlayerInstanceRef.current.destroy(); } catch (_) {}
-        }
+        console.log(`[EXEC #${currentExec}] Player inicializado via YouTube IFrame API.`);
         ytPlayerInstanceRef.current = new YT.Player(ytIframeRef.current, {
           events: {
             onReady: (e: any) => {
-              e.target.setPlaybackQuality?.("hd1080");
-              e.target.setPlaybackQualityRange?.("hd1080", "highres");
-              e.target.setSuggestedQuality?.("hd1080");
-            },
-            onStateChange: (e: any) => {
-              // 1 = PLAYING, 3 = BUFFERING
-              if (e.data === 1 || e.data === 3) {
+              console.log(`[EXEC #${currentExec}] Player pronto (onReady).`);
+              try {
                 e.target.setPlaybackQuality?.("hd1080");
                 e.target.setPlaybackQualityRange?.("hd1080", "highres");
                 e.target.setSuggestedQuality?.("hd1080");
-              }
-              // 0 = ENDED (YT.PlayerState.ENDED) - Interrompe loop imediatamente
-              if (e.data === 0) {
+                if (videoFinishedRef.current) {
+                  e.target.pauseVideo?.();
+                  e.target.stopVideo?.();
+                }
+              } catch (_) {}
+            },
+            onStateChange: (e: any) => {
+              // Bloqueio imediato se o vídeo já estiver marcado como finalizado
+              if (videoFinishedRef.current && (e.data === 1 || e.data === 3)) {
                 try {
                   e.target.pauseVideo?.();
                   e.target.stopVideo?.();
                 } catch (_) {}
-                handleVideoEnded();
+                return;
+              }
+
+              // 1 = PLAYING, 3 = BUFFERING
+              if (e.data === 1 || e.data === 3) {
+                try {
+                  e.target.setPlaybackQuality?.("hd1080");
+                  e.target.setPlaybackQualityRange?.("hd1080", "highres");
+                  e.target.setSuggestedQuality?.("hd1080");
+                } catch (_) {}
+              }
+              // 0 = ENDED (YT.PlayerState.ENDED) - Interrompe loop imediatamente
+              if (e.data === 0) {
+                console.log(`[EXEC #${currentExec}] Evento YT.PlayerState.ENDED recebido via IFrame API.`);
+                try {
+                  e.target.pauseVideo?.();
+                  e.target.stopVideo?.();
+                } catch (_) {}
+                handleVideoEndedRef.current("yt_player_ended", currentExec);
               }
             },
             onPlaybackQualityChange: (e: any) => {
               if (e.data && e.data !== "hd1080" && e.data !== "highres") {
-                e.target.setPlaybackQuality?.("hd1080");
+                try { e.target.setPlaybackQuality?.("hd1080"); } catch (_) {}
               }
             }
           }
         });
       }
-    } catch (_) {}
+    } catch (err) {
+      console.warn("attachYtPlayer fallback error:", err);
+    }
   };
 
-  // Centralized Video Slot Trigger: Starts any video (question or intro) in AJUSTADO (Fit) mode, resets state, and auto-plays
+  // Centralized Video Slot Trigger: Execução Confiável em 10 Etapas com Identificador e Diagnósticos
   const triggerVideoSlot = (slotId: string, announceText?: string) => {
-    // Sempre que um vídeo for iniciado, garante o modo AJUSTADO (Fit / object-fit: contain)
+    const execId = ++executionIdRef.current;
+    activeExecutionIdRef.current = execId;
+    hasEndedCurrentExecutionRef.current = -1;
+
+    console.log(`[EXEC #${execId}] 1. Gatilho selecionado: "${slotId}".`);
+
+    // 1. Validar / preparar player e manter modo ajustado (contain)
     setVideoFit("contain");
     try { safeStorage.setItem("eco_video_fit", "contain"); } catch (_) {}
     setHasStarted(true);
     setVideoFinished(false);
-    setActiveVideoSlot(slotId);
-    setYtReloadKey(prev => prev + 1);
 
-    // Estados da Experiência: INTRODUCAO para o vídeo inicial ou REPRODUZINDO para os gatilhos
+    // 2. Suspender temporariamente o reconhecimento de voz
+    suspendSpeechRecognition();
+    console.log(`[EXEC #${execId}] 2. Reconhecimento de voz suspenso.`);
+
+    // 3. Registrar / garantir disponibilidade do tratamento do evento de término
+    console.log(`[EXEC #${execId}] 3. Tratamento do evento de término registrado e ativo.`);
+
+    // 4. Atualizar o identificador do gatilho atual
+    const isSameSlot = activeVideoSlot === slotId;
+    setActiveVideoSlot(slotId);
+    if (isSameSlot) {
+      setYtReloadKey(prev => prev + 1);
+    }
+
     if (slotId === "intro") {
       setExperienceState("INTRODUCAO");
     } else {
       setExperienceState("REPRODUZINDO");
     }
+    console.log(`[EXEC #${execId}] 4. Identificador do gatilho atualizado para "${slotId}". Estado: ${slotId === "intro" ? "INTRODUCAO" : "REPRODUZINDO"}.`);
 
     if (announceText) {
       setAiResponseText(announceText);
     }
 
-    // Mark question trigger as used so it is removed from available triggers
+    // 8. Marcar o gatilho como utilizado (para sair da lista de disponíveis)
     if (slotId !== "intro") {
       setUsedTriggerIds(prev => prev.includes(slotId) ? prev : [...prev, slotId]);
     }
 
-    // Automatically enforce 1080p resolution on start
+    // 5. Início da reprodução do vídeo
+    console.log(`[EXEC #${execId}] 5. Início da reprodução do vídeo.`);
     trigger1080pAutoPulse();
 
     setTimeout(() => {
@@ -914,9 +985,6 @@ export default function App() {
   useEffect(() => {
     safeStorage.setItem("eco_show_drones", String(showDrones));
   }, [showDrones]);
-
-  // Web Speech API references
-  const recognitionRef = useRef<any>(null);
 
   // Helper helper to clean and evaluate similarity between recognized text and target phrases
   const getFuzzyMatchScore = (input: string, targetPhrase: string): number => {
@@ -985,8 +1053,24 @@ export default function App() {
     safeStorage.setItem("eco_custom_questions", JSON.stringify(configToSave));
   }, [questions, introUrl, introName]);
 
-  // Handle ended event for both YouTube and direct HTML5 videos
-  const handleVideoEnded = () => {
+  // Sincroniza referência de término do vídeo para evitar closures obsoletas
+  useEffect(() => {
+    videoFinishedRef.current = videoFinished;
+  }, [videoFinished]);
+
+  // 6, 7, 8, 9, 10. Tratamento unificado de término de vídeo com proteção contra execuções duplicadas e closures
+  const handleVideoEnded = (source: string = "unknown", execId?: number) => {
+    const targetExec = execId ?? activeExecutionIdRef.current;
+
+    // Proteção: Garante que o evento de término seja tratado uma única vez por reprodução
+    if (hasEndedCurrentExecutionRef.current === targetExec) {
+      console.log(`[EXEC #${targetExec}] Evento de término duplicado ignorado (fonte: ${source}).`);
+      return;
+    }
+    hasEndedCurrentExecutionRef.current = targetExec;
+
+    console.log(`[EXEC #${targetExec}] 6. Evento de vídeo finalizado (fonte: ${source}).`);
+
     // 1. Interrompe qualquer tentativa de loop no player do YouTube
     try {
       if (ytPlayerInstanceRef.current && typeof ytPlayerInstanceRef.current.pauseVideo === "function") {
@@ -1010,79 +1094,77 @@ export default function App() {
       }
     } catch (_) {}
 
+    // 7. Finalizar o estado de reprodução
     setVideoFinished(true);
     setShowReplayPrompt(true);
     setViewedSlots((prev) => {
       if (prev.includes(activeVideoSlot)) return prev;
       return [...prev, activeVideoSlot];
     });
-    // Return / exit full screen when video ends to show available triggers
     exitFullscreenAuto();
+    console.log(`[EXEC #${targetExec}] 7. Estado de reprodução encerrado.`);
 
-    // 4. Transição de Estados da Experiência:
-    // "O assistente virtual retorna ao estado de escuta.
-    // O aplicativo apresenta a opção para o usuário falar ou selecionar um dos gatilhos disponíveis.
-    // IMPORTANTE: Não iniciar automaticamente o reconhecimento de voz sem verificar se o usuário concedeu permissão ao microfone. Se não houver permissão, mostrar a opção para ativar o microfone."
-    if (micPermission === "granted") {
-      setExperienceState("ESCUTANDO");
-      setTimeout(() => {
-        if (!isListening && !isRecordingMedia) {
-          startListeningIfAllowed();
-        }
-      }, 400);
-    } else {
-      setExperienceState("AGUARDANDO");
-    }
+    // 8. O assistente virtual retorna ao estado de escuta
+    setExperienceState("ESCUTANDO");
+    console.log(`[EXEC #${targetExec}] 8. Estado do assistente alterado para: ESCUTANDO.`);
+
+    // 9. Reativar reconhecimento de voz se o usuário concedeu permissão
+    setTimeout(() => {
+      if (micPermission === "granted") {
+        console.log(`[EXEC #${targetExec}] 9. Reconhecimento de voz reativado automaticamente.`);
+        startListeningIfAllowed();
+      } else {
+        console.log(`[EXEC #${targetExec}] 9. Microfone pronto para ativação (permissão não concedida ou pendente).`);
+      }
+    }, 350);
+
+    // 10. Disponibilizar os próximos gatilhos para a próxima interação
+    const remainingCount = effectiveQuestions.filter(q => !usedTriggerIds.includes(q.id) && q.id !== activeVideoSlot).length;
+    console.log(`[EXEC #${targetExec}] 10. Próximos gatilhos disponibilizados: ${remainingCount} restantes.`);
   };
+
+  // Mantém a referência da função sempre atualizada para chamadas externas sem recriar listeners
+  useEffect(() => {
+    handleVideoEndedRef.current = handleVideoEnded;
+  });
 
   const handleReplayVideo = () => {
-    setVideoFit("contain");
-    try { safeStorage.setItem("eco_video_fit", "contain"); } catch (_) {}
-    setVideoFinished(false);
-    setExperienceState(activeVideoSlot === "intro" ? "INTRODUCAO" : "REPRODUZINDO");
-    const currentUrl = getActiveVideoUrl();
-    const ytId = getYouTubeVideoId(currentUrl);
-    if (ytId) {
-      setYtReloadKey(prev => prev + 1);
-      trigger1080pAutoPulse();
-      if (ytIframeRef.current?.contentWindow) {
-        try {
-          ytIframeRef.current.contentWindow.postMessage('{"event":"command","func":"seekTo","args":[0, true]}', '*');
-          ytIframeRef.current.contentWindow.postMessage('{"event":"command","func":"playVideo","args":""}', '*');
-          enforceYtMaxQuality();
-        } catch (_) {}
-      }
-    } else if (videoRef.current) {
-      videoRef.current.currentTime = 0;
-      const playPromise = videoRef.current.play();
-      if (playPromise !== undefined) {
-        playPromise.catch(err => console.warn("Failed to play: ", err));
-      }
-    }
+    triggerVideoSlot(activeVideoSlot, "Reiniciando vídeo.");
   };
 
-  // Monitoramento de fim de vídeo para garantir que YouTube Shorts nunca entre em loop automático
+  // Monitoramento contínuo: Handshake do YouTube IFrame e fallback para garantir término sem loop
   useEffect(() => {
-    if (!hasStarted || videoFinished) return;
+    if (!hasStarted) return;
     const interval = setInterval(() => {
       try {
-        if (ytPlayerInstanceRef.current && typeof ytPlayerInstanceRef.current.getCurrentTime === "function") {
-          const curr = ytPlayerInstanceRef.current.getCurrentTime();
-          const dur = ytPlayerInstanceRef.current.getDuration();
-          if (dur > 0 && curr >= dur - 0.35) {
-            try {
-              ytPlayerInstanceRef.current.pauseVideo?.();
-              ytPlayerInstanceRef.current.stopVideo?.();
-            } catch (_) {}
-            handleVideoEnded();
+        // Envia handshake contínuo de listening para o iframe reportar eventos de término
+        if (ytIframeRef.current?.contentWindow) {
+          ytIframeRef.current.contentWindow.postMessage('{"event":"listening","id":1,"channel":"widget"}', '*');
+        }
+
+        // Se o vídeo está ativo e ainda não foi finalizado, verifica tempo restante como segurança
+        if (!videoFinishedRef.current) {
+          const currentExec = activeExecutionIdRef.current;
+          if (ytPlayerInstanceRef.current && typeof ytPlayerInstanceRef.current.getCurrentTime === "function") {
+            const curr = ytPlayerInstanceRef.current.getCurrentTime();
+            const dur = ytPlayerInstanceRef.current.getDuration();
+            if (dur > 0 && curr >= dur - 0.45) {
+              console.log(`[EXEC #${currentExec}] Fallback timer detectou término do vídeo (curr: ${curr.toFixed(2)}, dur: ${dur.toFixed(2)}).`);
+              try {
+                ytPlayerInstanceRef.current.pauseVideo?.();
+                ytPlayerInstanceRef.current.stopVideo?.();
+              } catch (_) {}
+              handleVideoEndedRef.current("interval_time_fallback", currentExec);
+            }
           }
         }
       } catch (_) {}
-    }, 250);
-    return () => clearInterval(interval);
-  }, [hasStarted, videoFinished, activeVideoSlot, micPermission]);
+    }, 300);
 
-  // Listen to YouTube postMessage events for auto-ended state detection and 1080p quality enforcement
+    return () => clearInterval(interval);
+  }, [hasStarted]);
+
+  // Listener estável para postMessage do YouTube Player: detecta onStateChange 0 e infoDelivery playerState 0
   useEffect(() => {
     const handleYtMessage = (event: MessageEvent) => {
       try {
@@ -1095,7 +1177,20 @@ export default function App() {
           }
         }
         if (payload) {
-          // When YouTube player reports ready, listening, or transitions to playing (1) or buffering (3)
+          const currentExec = activeExecutionIdRef.current;
+
+          // Proteção Anti-Loop: Se o vídeo já foi finalizado, bloquear categoricamente qualquer reprodução
+          if (videoFinishedRef.current && (payload.info === 1 || payload.info?.playerState === 1 || payload.info === 3 || payload.info?.playerState === 3)) {
+            console.log(`[ANTI-LOOP] Bloqueada tentativa de reinício automático do YouTube.`);
+            try {
+              ytPlayerInstanceRef.current?.pauseVideo?.();
+              ytPlayerInstanceRef.current?.stopVideo?.();
+              ytIframeRef.current?.contentWindow?.postMessage('{"event":"command","func":"pauseVideo","args":""}', '*');
+              ytIframeRef.current?.contentWindow?.postMessage('{"event":"command","func":"stopVideo","args":""}', '*');
+            } catch (_) {}
+            return;
+          }
+
           if (
             payload.event === "onReady" ||
             payload.event === "initialDelivery" ||
@@ -1106,19 +1201,14 @@ export default function App() {
           ) {
             enforceYtMaxQuality();
           }
-          // YouTube API onStateChange: 0 is ENDED
-          if (payload.event === "onStateChange" && payload.info === 0) {
-            handleVideoEnded();
-          } else if (payload.info && payload.info.playerState === 0) {
-            handleVideoEnded();
-          }
 
-          // Anti-loop protection: if the video is already marked as finished, block any auto-replay from YouTube Shorts
-          if (videoFinished && (payload.info === 1 || payload.info?.playerState === 1)) {
-            try {
-              ytIframeRef.current?.contentWindow?.postMessage('{"event":"command","func":"pauseVideo","args":""}', '*');
-              ytIframeRef.current?.contentWindow?.postMessage('{"event":"command","func":"stopVideo","args":""}', '*');
-            } catch (_) {}
+          // YouTube API onStateChange: 0 é ENDED
+          if (payload.event === "onStateChange" && payload.info === 0) {
+            console.log(`[EXEC #${currentExec}] PostMessage onStateChange: 0 recebido.`);
+            handleVideoEndedRef.current("postMessage_onStateChange", currentExec);
+          } else if (payload.info && payload.info.playerState === 0) {
+            console.log(`[EXEC #${currentExec}] PostMessage infoDelivery playerState: 0 recebido.`);
+            handleVideoEndedRef.current("postMessage_playerState0", currentExec);
           }
         }
       } catch (_) {}
@@ -1126,7 +1216,7 @@ export default function App() {
 
     window.addEventListener("message", handleYtMessage);
     return () => window.removeEventListener("message", handleYtMessage);
-  }, [activeVideoSlot, videoFinished, micPermission]);
+  }, []);
 
   // Sync mute to YouTube iframe via postMessage
   useEffect(() => {
@@ -1172,7 +1262,6 @@ export default function App() {
 
     if (isYt) {
       setVideoPlayError("");
-      setYtReloadKey(prev => prev + 1);
     } else if (videoRef.current) {
       const v = videoRef.current;
       setVideoPlayError("");
@@ -2266,18 +2355,19 @@ export default function App() {
                       <div className="absolute inset-0 bg-black flex items-center justify-center w-full h-full max-w-full max-h-full overflow-hidden">
                         {isYouTubeUrl(getActiveVideoUrl()) ? (
                           <div className="w-full h-full max-w-full max-h-full relative overflow-hidden bg-black flex items-center justify-center">
-                            {!videoFinished && (
                             <iframe
                               ref={ytIframeRef}
                               id="wit-yt-iframe"
                               key={`${activeVideoSlot}-${getYouTubeVideoId(getActiveVideoUrl())}-${ytReloadKey}`}
-                              src={`https://www.youtube-nocookie.com/embed/${getYouTubeVideoId(getActiveVideoUrl())}?autoplay=1&mute=${videoMuted ? 1 : 0}&enablejsapi=1&origin=${encodeURIComponent(typeof window !== "undefined" ? window.location.origin : "")}&playsinline=1&rel=0&modestbranding=1&controls=1&loop=0&vq=hd1080&hd=1&suggestedQuality=hd1080&fmt=22&highres=1`}
+                              src={videoFinished ? "about:blank" : `https://www.youtube-nocookie.com/embed/${getYouTubeVideoId(getActiveVideoUrl())}?autoplay=1&mute=${videoMuted ? 1 : 0}&enablejsapi=1&origin=${encodeURIComponent(typeof window !== "undefined" ? window.location.origin : "")}&playsinline=1&rel=0&modestbranding=1&controls=1&loop=0&vq=hd1080&hd=1&suggestedQuality=hd1080&fmt=22&highres=1`}
                               title={getActiveVideoTitle()}
                               onLoad={() => {
-                                triggerQualityAutoPulse("hd1080");
-                                attachYtPlayer();
+                                if (!videoFinishedRef.current) {
+                                  triggerQualityAutoPulse("hd1080");
+                                  attachYtPlayer();
+                                }
                               }}
-                              className="w-full h-full max-w-full max-h-full aspect-video border-0 select-none pointer-events-auto transition-all duration-300 video-fit-contain"
+                              className={`w-full h-full max-w-full max-h-full aspect-video border-0 select-none pointer-events-auto transition-all duration-300 video-fit-contain ${videoFinished ? "opacity-0 pointer-events-none" : "opacity-100"}`}
                               allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
                               allowFullScreen
                               style={{
@@ -2290,7 +2380,6 @@ export default function App() {
                                 imageRendering: "-webkit-optimize-contrast"
                               }}
                             />
-                            )}
 
                             {/* Extensão 1080p Only Lock Badge & Status */}
                             {force1080pOnly && isYouTubeUrl(getActiveVideoUrl()) && !isFullscreen && (
@@ -2335,8 +2424,7 @@ export default function App() {
                             loop={false}
                             muted={videoMuted}
                             playsInline
-                            webkit-playsinline="true"
-                            onEnded={handleVideoEnded}
+                            onEnded={() => handleVideoEnded("html5_video_ended")}
                             onError={() => {
                               setVideoPlayError("Não foi possível reproduzir este vídeo.");
                             }}
@@ -2398,22 +2486,20 @@ export default function App() {
                                       }`}
                                     >
                                       <Mic className="w-4 h-4 shrink-0" />
-                                      <span className="whitespace-nowrap leading-none">
+                                      <span className="whitespace-nowrap leading-none font-extrabold">
                                         {isListening 
                                           ? "Ouvindo... Fale a pergunta agora" 
                                           : isAnalyzing 
                                           ? "Processando fala..." 
-                                          : micPermission === "granted"
-                                          ? "Falar com a Assistente"
-                                          : "Ativar Microfone / Falar"}
+                                          : "FALAR NO MICROFONE"}
                                       </span>
                                     </button>
                                     <span className="text-[9px] font-mono text-zinc-400">
                                       {isListening 
                                         ? "Escuta ativa: fale uma pergunta ou selecione um gatilho abaixo" 
                                         : micPermission === "granted" 
-                                        ? "Microfone autorizado: clique para falar" 
-                                        : "Microfone desligado: clique para ativar ou selecione abaixo"}
+                                        ? "Microfone autorizado: clique no botão acima ou selecione um gatilho" 
+                                        : "Clique em FALAR NO MICROFONE para autorizar ou selecione um gatilho"}
                                     </span>
                                   </div>
                                 )}
